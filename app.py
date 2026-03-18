@@ -31,6 +31,13 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# Ghi chú nhanh về luồng xử lý:
+# 1) Người dùng upload ảnh → đọc bằng PIL
+# 2) Resize về 224x224 (chuẩn MobileNetV2)
+# 3) Tiền xử lý (preprocess_input) *chỉ khi* model chưa nhúng preprocess
+# 4) `model.predict` → vector đầu ra (logits hoặc xác suất)
+# 5) Chuẩn hóa về xác suất (softmax khi cần) → hiển thị Top‑K
+
 # ───────────────────────────────────────────────
 # CUSTOM CSS – giao diện hiện đại
 # ───────────────────────────────────────────────
@@ -236,6 +243,11 @@ st.markdown(
 # ───────────────────────────────────────────────
 @st.cache_resource
 def load_model():
+    """Load model từ thư mục cùng cấp với app.
+
+    `st.cache_resource` giúp model chỉ được load 1 lần (giảm thời gian chờ)
+    dù người dùng có thay đổi slider/toggle khiến app rerun.
+    """
     base_dir = Path(__file__).resolve().parent
     candidates = [
         base_dir / "fruit_model_final_15classes.keras",
@@ -251,6 +263,11 @@ def load_model():
 
 
 def get_num_classes(model: tf.keras.Model) -> int | None:
+    """Suy ra số lớp (num_classes) từ `model.output_shape`.
+
+    - Thường output_shape là (None, num_classes)
+    - Một số model có multi-output (list of shapes)
+    """
     output_shape = model.output_shape
     if isinstance(output_shape, tuple) and len(output_shape) >= 2:
         return int(output_shape[-1])
@@ -262,6 +279,11 @@ def get_num_classes(model: tf.keras.Model) -> int | None:
 
 
 def model_has_preprocess_layer(model: tf.keras.Model) -> bool:
+    """Kiểm tra model có lớp tên `preprocess` không.
+
+    Một số pipeline export model sẽ nhúng tiền xử lý (rescale/normalize)
+    thành một layer trong graph; nếu có, ta không preprocess thêm lần nữa.
+    """
     def _walk(layer: tf.keras.layers.Layer) -> bool:
         if getattr(layer, "name", "") == "preprocess":
             return True
@@ -272,6 +294,12 @@ def model_has_preprocess_layer(model: tf.keras.Model) -> bool:
 
 
 def load_class_names(model_path: Path) -> list[str] | None:
+    """Đọc danh sách nhãn (class names) từ file đi kèm model nếu có.
+
+    Hỗ trợ:
+    - `*.class_names.json` với key `class_names`.
+    - `*.class_names.txt` (mỗi dòng một nhãn).
+    """
     json_path = model_path.with_name(model_path.name + ".class_names.json")
     txt_path = model_path.with_name(model_path.name + ".class_names.txt")
     if json_path.exists():
@@ -305,12 +333,14 @@ if not num_classes or num_classes <= 0:
 
 # ── Sidebar ──
 st.sidebar.markdown("### ⚙️ Cài đặt")
+# Top‑K: số dự đoán có xác suất cao nhất muốn hiển thị
 top_k = st.sidebar.slider(
     "🔢 Hiển thị Top-K",
     min_value=1,
     max_value=min(10, num_classes),
     value=min(5, num_classes),
 )
+# Có thể tắt biểu đồ để UI nhẹ hơn
 show_chart = st.sidebar.toggle("📊 Hiển thị biểu đồ", value=True)
 st.sidebar.markdown("---")
 st.sidebar.markdown(
@@ -329,6 +359,8 @@ st.markdown(
 # ───────────────────────────────────────────────
 # DANH SÁCH NHÃN
 # ───────────────────────────────────────────────
+# `default_class_names_en`: danh sách nhãn mặc định theo Fruits-360.
+# Nếu có sidecar class_names thì app sẽ ưu tiên dùng để đảm bảo đúng thứ tự.
 default_class_names_en = [
     "Apple Red 1", "Avocado 1", "Banana 1", "Cocos 1", "Kiwi 1",
     "Lemon 1", "Mango 1", "Orange 1", "Papaya 1", "Pineapple 1",
@@ -356,11 +388,15 @@ fruit_emoji: dict[str, str] = {
 
 label_vn: dict[str, str] = {}
 for k, v in label_vn_base.items():
+    # Map cả key gốc và key có hậu tố " 1" về cùng tên tiếng Việt
+    # (dataset hay dùng dạng "Apple Red 1", "Banana 1", ...)
     label_vn[k] = v
     label_vn[f"{k} 1"] = v
 
 class_names_en = load_class_names(model_path) or default_class_names_en
 if len(class_names_en) != num_classes:
+    # Nếu số nhãn không trùng số output của model → dùng nhãn giả Class_i
+    # để tránh lỗi index và vẫn chạy được UI.
     st.warning(
         f"⚠️ Số nhãn ({len(class_names_en)}) không khớp số classes "
         f"của model ({num_classes}). Dùng nhãn Class_i."
@@ -371,23 +407,70 @@ if len(class_names_en) != num_classes:
 # HÀM DỰ ĐOÁN
 # ───────────────────────────────────────────────
 def predict_fruit(image):
-    img = ImageOps.exif_transpose(image).convert("RGB")
-    img = img.resize((224, 224))
-    img_array = np.array(img, dtype=np.float32)
-    if not model_has_preprocess_layer(model):
-        img_array = preprocess_input(img_array)
-    img_array = np.expand_dims(img_array, axis=0)
+        """Dự đoán loại trái cây từ ảnh.
 
-    raw = model.predict(img_array, verbose=0)
-    preds = raw[0] if isinstance(raw, (list, tuple)) else raw
-    preds = np.asarray(preds).reshape(-1)
-    if preds.size != num_classes:
-        raise ValueError(f"Output size ({preds.size}) != num_classes ({num_classes})")
+        Input
+        - `image`: PIL Image (ảnh gốc từ uploader).
 
-    prob_sum = float(np.sum(preds))
-    if (preds.min() < 0) or (preds.max() > 1.2) or (abs(prob_sum - 1.0) > 0.05):
-        preds = tf.nn.softmax(preds).numpy()
-    return preds
+        Output
+        - `preds`: numpy array 1D, độ dài `num_classes`.
+            Thường là xác suất (tổng ~1). Nếu model trả logits, ta softmax để đổi sang xác suất.
+
+        Vì sao cần các bước tiền xử lý?
+        - Model MobileNetV2 thường học với ảnh kích thước 224x224.
+        - Ảnh từ điện thoại có thể bị xoay bằng metadata (EXIF orientation), nếu không sửa
+          thì resize/predict sẽ sai hướng → giảm độ chính xác.
+        """
+
+        # 1) Sửa hướng theo EXIF (nếu có), rồi ép về RGB.
+        #    - `exif_transpose` sẽ xoay/flip đúng chiều dựa trên tag EXIF.
+        #    - `.convert("RGB")` đảm bảo luôn có 3 kênh màu (loại bỏ alpha/ảnh xám).
+        img = ImageOps.exif_transpose(image).convert("RGB")
+
+        # 2) Resize về đúng input size của MobileNetV2.
+        #    Ở đây dùng resize trực tiếp (không crop). Nếu ảnh bị méo tỉ lệ,
+        #    vẫn chạy được nhưng có thể giảm chất lượng dự đoán.
+        img = img.resize((224, 224))
+
+        # 3) Chuyển PIL → numpy float32.
+        #    Shape lúc này: (224, 224, 3), dtype float32.
+        img_array = np.array(img, dtype=np.float32)
+
+        # 4) Tiền xử lý theo MobileNetV2 (nếu model chưa nhúng preprocess bên trong).
+        #    `preprocess_input` (MobileNetV2) thường đưa pixel từ [0..255] về [-1..1].
+        if not model_has_preprocess_layer(model):
+            img_array = preprocess_input(img_array)
+
+        # 5) Thêm batch dimension để đúng format Keras: (batch, height, width, channels)
+        #    Shape: (1, 224, 224, 3)
+        img_array = np.expand_dims(img_array, axis=0)
+
+        # 6) Chạy suy luận.
+        #    `model.predict` có thể trả:
+        #    - numpy array shape (1, num_classes)
+        #    - hoặc list/tuple (nếu model multi-output) → lấy output đầu tiên.
+        raw = model.predict(img_array, verbose=0)
+        preds = raw[0] if isinstance(raw, (list, tuple)) else raw
+
+        # 7) Đưa về vector 1D để dễ xử lý (Top‑K, softmax...).
+        preds = np.asarray(preds).reshape(-1)
+
+        # 8) Chặn lỗi nếu output không khớp số lớp suy ra từ model.
+        if preds.size != num_classes:
+            raise ValueError(f"Output size ({preds.size}) != num_classes ({num_classes})")
+
+        # 9) Chuẩn hóa về xác suất (phòng trường hợp model trả logits).
+        #    Heuristic:
+        #    - Nếu có giá trị âm → gần như chắc là logits.
+        #    - Nếu tổng không gần 1 hoặc max quá lớn → có thể chưa normalize.
+        #    Ngưỡng 1.2 và sai số tổng 0.05 để tránh softmax "thừa" trong trường hợp
+        #    model đã trả xác suất nhưng có nhiễu số học.
+        prob_sum = float(np.sum(preds))
+        if (preds.min() < 0) or (preds.max() > 1.2) or (abs(prob_sum - 1.0) > 0.05):
+            preds = tf.nn.softmax(preds).numpy()
+
+        # 10) Trả về xác suất từng lớp (numpy 1D).
+        return preds
 
 
 # ───────────────────────────────────────────────
@@ -395,6 +478,7 @@ def predict_fruit(image):
 # ───────────────────────────────────────────────
 def render_prob_bars(top_indices, probs, top_k_val):
     """Return HTML string of styled probability bars."""
+    # Để thanh nhìn trực quan, chiều rộng được chuẩn hóa theo max trong Top‑K.
     max_p = float(probs[top_indices[0]]) if len(top_indices) > 0 else 1.0
     rows = []
     for rank, idx in enumerate(top_indices):
@@ -420,6 +504,9 @@ def render_prob_bars(top_indices, probs, top_k_val):
 # ───────────────────────────────────────────────
 # GIAO DIỆN CHÍNH
 # ───────────────────────────────────────────────
+# Layout 2 cột:
+# - Cột trái: upload + xem trước ảnh
+# - Cột phải: kết quả dự đoán + top‑k + biểu đồ (tùy chọn)
 left, right = st.columns([5, 7], gap="large")
 
 with left:
@@ -439,6 +526,7 @@ with left:
             unsafe_allow_html=True,
         )
     else:
+        # Mở ảnh từ file upload và hiển thị preview
         image = Image.open(uploaded_file)
         st.markdown('<div class="img-card">', unsafe_allow_html=True)
         st.image(image, caption=None, use_container_width=True)
@@ -450,6 +538,7 @@ with right:
             with st.spinner("🔍 Đang phân tích..."):
                 probs = predict_fruit(image)
 
+            # Sắp xếp xác suất giảm dần và lấy top‑k
             top_indices = np.argsort(probs)[::-1][: int(top_k)]
             best_idx = int(top_indices[0])
             best_en = class_names_en[best_idx]
@@ -468,6 +557,7 @@ with right:
             # ── Result card ──
             warn_html = ""
             if best_conf < 60:
+                # Cảnh báo: xác suất thấp thường do ảnh mờ/thiếu sáng/góc chụp khó
                 warn_html = (
                     '<div class="warn-card">'
                     "⚠️ Độ tin cậy thấp — ảnh có thể mờ, góc chụp khó hoặc trái cây ngoài danh sách."
@@ -495,6 +585,7 @@ with right:
 
             # ── Chart (optional) ──
             if show_chart:
+                # Tạo bảng Top‑K để vẽ biểu đồ cột
                 df_top = pd.DataFrame(
                     {
                         "Trái cây": [
