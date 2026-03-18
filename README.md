@@ -1,6 +1,8 @@
 # TriTueNhanTao-HocMay
-# Link colab 
-https://colab.research.google.com/drive/1xhncfiZBl9qf-xqqSLVXn5odjAsMQ3UH?usp=sharing
+# 1 link dulieu code github: https://github.com/nTienthang03/TriTueNhanTao-HocMay
+# 2 link colab : https://colab.research.google.com/drive/1xhncfiZBl9qf-xqqSLVXn5odjAsMQ3UH?usp=sharing
+# 3 link youtube baocao:https://youtu.be/Z-nD6ZjeU3s
+
 # Nhận diện trái cây bằng AI (15 lớp) — Streamlit + MobileNetV2
 
 Ứng dụng web đơn giản giúp nhận diện trái cây từ ảnh bằng mô hình học sâu (MobileNetV2). Người dùng tải ảnh lên, hệ thống trả về nhãn dự đoán tốt nhất và danh sách Top-K kèm xác suất.
